@@ -62,19 +62,33 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git \
  && rm -rf /var/lib/apt/lists/*
 
-# --- Resolve ComfyUI path (same fallback chain as deploy_latentsync_comfyui.sh:108) ---
-# Base image varies between releases — historically /workspace/runpod-slim/ComfyUI,
-# sometimes /workspace/ComfyUI directly. Symlink ensures downstream paths are stable.
-RUN COMFY_DIR="" \
- && for d in /workspace/ComfyUI /workspace/runpod-slim/ComfyUI /comfyui; do \
-        [ -d "$d" ] && COMFY_DIR="$d" && break; \
-    done \
- && [ -n "$COMFY_DIR" ] || (echo "FATAL: no ComfyUI dir in base image" && exit 1) \
- && echo "ComfyUI dir: $COMFY_DIR" \
+# --- Resolve ComfyUI path ---
+# The runpod/comfyui:latest image lazy-installs ComfyUI on container boot
+# (not at image build), so the deploy script's runtime fallback chain
+# (/workspace/ComfyUI → /workspace/runpod-slim/ComfyUI → /comfyui) finds
+# nothing during `docker build`. Strategy:
+#   1. Search the whole image for any ComfyUI directory (covers any path).
+#   2. If absent, clone it ourselves at /workspace/ComfyUI — same effect as
+#      the runtime install would have, except baked at build time so we
+#      don't pay the install cost on every pod boot.
+# Either way, downstream steps see a working tree at /workspace/ComfyUI.
+ARG COMFYUI_REPO=https://github.com/comfyanonymous/ComfyUI.git
+ARG COMFYUI_REF=v0.3.30
+RUN COMFY_DIR=$(find / -maxdepth 5 -type d -name ComfyUI 2>/dev/null | grep -v 'custom_nodes/ComfyUI' | head -1) \
+ && if [ -n "$COMFY_DIR" ]; then \
+        echo "Found ComfyUI in base image at $COMFY_DIR"; \
+    else \
+        echo "ComfyUI not in base image; cloning $COMFYUI_REPO @ $COMFYUI_REF"; \
+        git clone --depth 1 --branch "$COMFYUI_REF" "$COMFYUI_REPO" /workspace/ComfyUI; \
+        pip install --break-system-packages -r /workspace/ComfyUI/requirements.txt; \
+        COMFY_DIR=/workspace/ComfyUI; \
+    fi \
  && if [ "$COMFY_DIR" != "/workspace/ComfyUI" ]; then \
         rm -rf /workspace/ComfyUI 2>/dev/null || true; \
+        mkdir -p /workspace; \
         ln -s "$COMFY_DIR" /workspace/ComfyUI; \
-    fi
+    fi \
+ && ls -ld /workspace/ComfyUI && ls /workspace/ComfyUI/custom_nodes 2>/dev/null | head -5 || mkdir -p /workspace/ComfyUI/custom_nodes
 
 # --- Step 1: ComfyUI-LatentSyncWrapper + its deps (mirrors deploy script:130-170) ---
 # IMPORTANT: NO version pins. The deploy script runs `pip install -r
