@@ -144,9 +144,9 @@ RUN pip install \
         fastapi==0.109.0 \
         'uvicorn[standard]==0.27.0' \
         python-multipart==0.0.6 \
- && DEG=$(python3 -c "import basicsr.data.degradations as d; print(d.__file__)") \
+ && DEG=$(python3 -c "import basicsr, os; print(os.path.join(os.path.dirname(basicsr.__file__), 'data', 'degradations.py'))") \
  && sed -i 's|from torchvision.transforms.functional_tensor import rgb_to_grayscale|from torchvision.transforms.functional import rgb_to_grayscale|' "$DEG" \
- && python3 -c "import gfpgan; import basicsr; import mediapipe; print('postproc deps OK')"
+ && python3 -c "import gfpgan; import basicsr.data.degradations; import mediapipe; print('postproc deps OK')"
 
 # --- Apply patches: CI-O-22 (write_video + read_video imageio), no-face, cv2 fallback ---
 COPY patches/ /tmp/patches/
