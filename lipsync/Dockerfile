@@ -144,7 +144,7 @@ RUN pip install \
         fastapi==0.109.0 \
         'uvicorn[standard]==0.27.0' \
         python-multipart==0.0.6 \
- && DEG=$(python3 -c "import basicsr, os; print(os.path.join(os.path.dirname(basicsr.__file__), 'data', 'degradations.py'))") \
+ && DEG=$(python3 -c "import importlib.util, os; s=importlib.util.find_spec('basicsr'); print(os.path.join(os.path.dirname(s.origin), 'data', 'degradations.py'))") \
  && sed -i 's|from torchvision.transforms.functional_tensor import rgb_to_grayscale|from torchvision.transforms.functional import rgb_to_grayscale|' "$DEG" \
  && python3 -c "import gfpgan; import basicsr.data.degradations; import mediapipe; print('postproc deps OK')"
 
