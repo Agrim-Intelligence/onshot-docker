@@ -97,6 +97,19 @@ RUN git clone --depth 1 --branch ${COMFYUI_REF} ${COMFYUI_REPO} ComfyUI
 # torchaudio 2.4.0 come from the base too. CI-O-22 patch still applies (it
 # matches "from torchvision.transforms.functional import" — present in 0.19+).
 
+# --- Strip incompatible base packages (CI-O-58v) ---
+# The runpod/pytorch:2.4.0 base ships numpy 2.x + opencv-{contrib,}-python 4.13
+# (which require numpy>=2). LatentSync's wrapper code uses numpy 1.x APIs and
+# pins numpy==1.26.4 below — that downgrade breaks the pre-installed opencv-*
+# wheels (`cv2 ImportError: numpy.core.multiarray failed to import`), which
+# then crash-loops ComfyUI on container start (v1.6.3 hit this). Uninstall
+# them now so our own opencv-python-headless==4.10.0.84 (numpy 1.x compatible)
+# is the single cv2 provider at runtime.
+RUN pip uninstall -y \
+        opencv-contrib-python \
+        opencv-python \
+        opencv-python-headless || true
+
 # --- ComfyUI requirements ---
 # Skip strict torch pins inside ComfyUI's requirements.txt so they don't bump
 # the base's torch 2.4.0 to 2.5+. The other packages (psutil, kornia, etc.)
@@ -260,7 +273,7 @@ LABEL org.opencontainers.image.title="onshot-lipsync-latentsync"
 LABEL org.opencontainers.image.description="OnShot lipsync pod — ComfyUI + LatentSync 1.6 + post-processing sidecar, fully baked"
 LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/kg-storytelling-platform"
 LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.6.3"
+LABEL org.opencontainers.image.version="1.6.4"
 LABEL onshot.role="lipsync"
 LABEL onshot.engine="latentsync-1.6"
 
