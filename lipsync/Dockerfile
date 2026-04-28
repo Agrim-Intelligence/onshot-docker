@@ -46,8 +46,15 @@
 
 # -----------------------------------------------------------------------------
 # Stage 1 — builder: clone repos, apply patches, download checkpoints, install deps
+#
+# Base: runpod/pytorch:2.4.0 ships a *tuned* torch wheel — same one cycle-wala
+# ran on yesterday at ~5min/shot. The plain nvidia/cuda base + pip-installed
+# torch==2.5.1 was 3-5x slower (vanilla SDPA attention path; bandhani took
+# ~22min/shot on the same A5000-class GPU). Pinning the runpod base eliminates
+# the regression. Don't downgrade further — runpod hosts cache this base layer
+# on every machine, so pull cost stays similar to a stock cuda image.
 # -----------------------------------------------------------------------------
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04 AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG PYTHONDONTWRITEBYTECODE=1
@@ -83,16 +90,20 @@ RUN apt-get update \
 WORKDIR /opt
 RUN git clone --depth 1 --branch ${COMFYUI_REF} ${COMFYUI_REPO} ComfyUI
 
-# --- Pinned PyTorch stack (CUDA 12.4 wheels) ---
-# torchvision >= 0.20 has no write_video / read_video — that's why we apply
-# CI-O-22. Don't downgrade torchvision: the patch is the contract.
-RUN pip install --index-url https://download.pytorch.org/whl/cu124 \
-        torch==2.5.1 \
-        torchvision==0.20.1 \
-        torchaudio==2.5.1
+# --- PyTorch stack ---
+# Inherited from the runpod/pytorch:2.4.0 base — DO NOT reinstall torch here.
+# The base ships a tuned wheel (cycle-wala measured ~5min/shot vs 22min on a
+# vanilla pip torch==2.5.1 — the regression is real). torchvision 0.19.0 +
+# torchaudio 2.4.0 come from the base too. CI-O-22 patch still applies (it
+# matches "from torchvision.transforms.functional import" — present in 0.19+).
 
 # --- ComfyUI requirements ---
-RUN pip install -r /opt/ComfyUI/requirements.txt
+# Skip strict torch pins inside ComfyUI's requirements.txt so they don't bump
+# the base's torch 2.4.0 to 2.5+. The other packages (psutil, kornia, etc.)
+# install fine.
+RUN sed -i -E '/^(torch|torchvision|torchaudio|torchsde)([=<>!]|$)/d' \
+        /opt/ComfyUI/requirements.txt \
+ && pip install -r /opt/ComfyUI/requirements.txt
 
 # --- Custom nodes (cloned then pinned to ref) ---
 WORKDIR /opt/ComfyUI/custom_nodes
@@ -105,13 +116,21 @@ RUN git clone ${LATENTSYNC_WRAPPER_REPO} ComfyUI-LatentSyncWrapper \
  && git checkout ${VIDEO_HELPER_REF}
 
 # --- LatentSync wrapper deps + pinned compatibility set ---
-RUN pip install -r /opt/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/requirements.txt \
+# Strip torch/torchvision/torchaudio pins from the wrapper requirements too —
+# same reason as ComfyUI's requirements.txt above. The wrapper's own deps
+# (mediapipe, librosa, etc.) install cleanly.
+RUN sed -i -E '/^(torch|torchvision|torchaudio|torchsde)([=<>!]|$)/d' \
+        /opt/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/requirements.txt \
+ && sed -i -E '/^(torch|torchvision|torchaudio|torchsde)([=<>!]|$)/d' \
+        /opt/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt \
+ && pip install -r /opt/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/requirements.txt \
  && pip install -r /opt/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt
-# torchcodec must match the installed torch ABI; pip resolves a compatible
-# version from the cu124 stack above. soundfile is the fallback audio backend
-# we force on at runtime (TORCHAUDIO_BACKEND=soundfile in entrypoint).
+# torchcodec must match the installed torch ABI. torch 2.4.0 → torchcodec 0.3.0
+# (0.4.0 was built for torch 2.5+ and would force an ABI bump that defeats the
+# whole reason we're on the runpod base). soundfile is the fallback audio
+# backend we force on at runtime (TORCHAUDIO_BACKEND=soundfile in entrypoint).
 RUN pip install \
-        torchcodec==0.4.0 \
+        torchcodec==0.3.0 \
         soundfile==0.12.1 \
         insightface==0.7.3 \
         onnxruntime-gpu==1.20.1 \
@@ -225,9 +244,15 @@ RUN mkdir -p /workspace/gfpgan_weights \
         'https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth'
 
 # -----------------------------------------------------------------------------
-# Stage 2 — runtime: smaller base, copy artefacts from builder
+# Stage 2 — runtime: same runpod/pytorch base for ABI parity with builder
+#
+# Using the runpod/pytorch base in BOTH stages means the tuned torch 2.4.0
+# wheel from the builder's /usr/local/lib/python3.11/dist-packages copies in
+# clean — no version mismatch with a different runtime base. The base is
+# already cached on most runpod hosts (it's their default pytorch worker
+# image), so first-pull cost is ~equivalent to cuda:12.4.1-runtime.
 # -----------------------------------------------------------------------------
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04 AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -235,23 +260,22 @@ LABEL org.opencontainers.image.title="onshot-lipsync-latentsync"
 LABEL org.opencontainers.image.description="OnShot lipsync pod — ComfyUI + LatentSync 1.6 + post-processing sidecar, fully baked"
 LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/kg-storytelling-platform"
 LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.6.2"
+LABEL org.opencontainers.image.version="1.6.3"
 LABEL onshot.role="lipsync"
 LABEL onshot.engine="latentsync-1.6"
 
-# Runtime apt deps only — no compilers, no headers
+# Runtime apt deps. ffmpeg / libgl / etc. — the runpod base has python 3.11
+# already, so we don't reinstall it.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates curl ffmpeg \
-        python3.11 python3-pip \
         libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
- && rm -rf /var/lib/apt/lists/* \
- && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
- && update-alternatives --install /usr/bin/python  python  /usr/bin/python3.11 1
+ && rm -rf /var/lib/apt/lists/*
 
-# Copy installed python packages from builder
-COPY --from=builder /usr/lib/python3.11 /usr/lib/python3.11
-COPY --from=builder /usr/local/lib/python3.11 /usr/local/lib/python3.11
+# Copy ONLY the pip-installed extras (everything our builder added on top of
+# the base). /usr/local/lib/python3.11/dist-packages contains both the base's
+# tuned torch + all our extra wheels, so a single COPY is correct.
+COPY --from=builder /usr/local/lib/python3.11/dist-packages /usr/local/lib/python3.11/dist-packages
 
 # Copy ComfyUI tree (includes patched custom_nodes + all checkpoints)
 COPY --from=builder /opt/ComfyUI /opt/ComfyUI
