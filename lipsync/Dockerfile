@@ -273,7 +273,7 @@ LABEL org.opencontainers.image.title="onshot-lipsync-latentsync"
 LABEL org.opencontainers.image.description="OnShot lipsync pod — ComfyUI + LatentSync 1.6 + post-processing sidecar, fully baked"
 LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/kg-storytelling-platform"
 LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.6.4"
+LABEL org.opencontainers.image.version="1.6.5"
 LABEL onshot.role="lipsync"
 LABEL onshot.engine="latentsync-1.6"
 
