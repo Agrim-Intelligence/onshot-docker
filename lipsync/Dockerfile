@@ -1,215 +1,123 @@
 # =============================================================================
-# OnShot Lipsync Pod — pre-baked Docker image
+# OnShot Lipsync Pod — pre-baked Docker image (v1.6.6)
 #
 # This image is what RunPod pulls when launching a lipsync pod. Everything
-# the deploy_latentsync_comfyui.sh script used to do live (clone, pip install,
-# checkpoint downloads, three patches) is baked at build time. Pod boot
-# becomes "pull image (cached after first pull) + start two servers" — ~2 min
-# instead of the 30+ min flaky setup that bit cycle-wala / bandhani-jaipur /
+# deploy_latentsync_comfyui.sh did live (clone, pip install, checkpoint
+# downloads, three patches) is baked at build time. Pod boot becomes "pull
+# image (cached after first pull) + start two servers" — ~2 min instead of
+# the 30+ min flaky setup that bit cycle-wala / bandhani-jaipur /
 # chai-aur-chemistry runs.
 #
+# DESIGN PRINCIPLE (v1.6.6)
+# -------------------------
+# Mirror deploy_latentsync_comfyui.sh EXACTLY. That script worked yesterday
+# at ~5 min/shot. v1.6.2 → v1.6.5 deviated from it (different base, pinned
+# torch + numpy, etc.) and either ran 4× slower or crash-looped. The script
+# is the contract; the Dockerfile is the contract baked at build time.
+#
+# Specifically:
+#   * BASE: runpod/comfyui:latest  (NOT runpod/pytorch — runpod/comfyui
+#     ships ComfyUI + the right torch/cv2/numpy stack pre-installed).
+#   * pip: NO version pins anywhere except `mediapipe<0.10.15` (the only
+#     pin the script applies). Let pip resolve compatible versions on top
+#     of the base, exactly as the script does.
+#   * --break-system-packages: required on Ubuntu 24+ PEP 668 protection.
+#   * Find ComfyUI dir at build time via the same fallback chain the
+#     script uses (/workspace/ComfyUI → /workspace/runpod-slim/ComfyUI →
+#     /comfyui), then symlink /workspace/ComfyUI for downstream paths.
+#
 # WHAT THIS IMAGE CONTAINS
-#   /opt/ComfyUI                       — ComfyUI pinned (see COMFYUI_REF below)
-#   .../custom_nodes/ComfyUI-LatentSyncWrapper       — pinned commit, patched
-#   .../custom_nodes/ComfyUI-VideoHelperSuite        — pinned commit
+#   /workspace/ComfyUI/                              — symlink to actual dir
+#   .../custom_nodes/ComfyUI-LatentSyncWrapper       — patched (CI-O-22 + no-face)
+#   .../custom_nodes/ComfyUI-VideoHelperSuite        — required for VHS_LoadVideo
 #   .../checkpoints/latentsync_unet.pt               — 5 GB
 #   .../checkpoints/stable_syncnet.pt                — 1.6 GB
 #   .../checkpoints/whisper/tiny.pt                  — ~75 MB
-#   .../checkpoints/vae/diffusion_pytorch_model.safetensors + config.json — 335 MB
+#   .../checkpoints/vae/{config.json,safetensors}    — 335 MB
 #   /workspace/CodeFormer                            — repo + 3 face weights
 #   /workspace/gfpgan_weights/GFPGANv1.4.pth         — 332 MB
 #   /opt/api_server_postprocess.py                   — :8000 sidecar
 #   /entrypoint.sh                                   — boots ComfyUI + sidecar
 #
 # WHAT THIS IMAGE INTENTIONALLY DOES NOT CONTAIN
-#   • RealESRGAN_x4plus_anime_6B.pth — optional bg upsampler for CodeFormer.
-#     Postprocess server gracefully degrades when missing (bake later if needed).
-#   • Any secrets — image is publishable to a public GHCR registry.
-#
-# WHY BAKE
-#   Six known live-deploy failure modes the image eliminates:
-#     1. apt-get exit 100 (transient mirror failures)
-#     2. git clone shallow.lock race
-#     3. checkpoint silent no-op (4 curls, no size verification mid-script)
-#     4. CRLF wrapper patch silent miss
-#     5. postprocess server start race with SSH disconnect
-#     6. two-deploy concurrent stomp (auto-trigger + explicit POST)
-#
-# BUILD / PUSH (manual; not run in CI by default — see README)
-#   docker build -t ghcr.io/agrim-intelligence/lipsync-latentsync:v1.6.2 \
-#                infra/docker/lipsync
-#   docker push  ghcr.io/agrim-intelligence/lipsync-latentsync:v1.6.2
-#
-# Versioning: v1.6.X for patch changes, v1.X.Y when ComfyUI/wrapper bumps,
-# vX.Y.Z when interface changes. Keep VERSION in sync.
+#   * RealESRGAN_x4plus_anime_6B.pth — optional bg upsampler for CodeFormer.
+#     Postprocess server gracefully degrades when missing.
+#   * Any secrets — image is publishable to a public GHCR registry.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Stage 1 — builder: clone repos, apply patches, download checkpoints, install deps
-#
-# Base: runpod/pytorch:2.4.0 ships a *tuned* torch wheel — same one cycle-wala
-# ran on yesterday at ~5min/shot. The plain nvidia/cuda base + pip-installed
-# torch==2.5.1 was 3-5x slower (vanilla SDPA attention path; bandhani took
-# ~22min/shot on the same A5000-class GPU). Pinning the runpod base eliminates
-# the regression. Don't downgrade further — runpod hosts cache this base layer
-# on every machine, so pull cost stays similar to a stock cuda image.
+# Single stage on runpod/comfyui:latest. Multi-stage doesn't help when the
+# base already has ComfyUI + torch + cv2 + numpy baked in — there's nothing
+# to "build" separately, just packages to layer on top.
 # -----------------------------------------------------------------------------
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04 AS builder
+FROM runpod/comfyui:latest
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG PYTHONDONTWRITEBYTECODE=1
 ARG PIP_NO_CACHE_DIR=1
 ARG PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# --- Pinned upstream refs (escape transitive drift) ---
-# ComfyUI: pin to a recent stable tag matching what cycle-wala ran on
-ARG COMFYUI_REPO=https://github.com/comfyanonymous/ComfyUI.git
-ARG COMFYUI_REF=v0.3.30
-# LatentSyncWrapper: pin to a verified commit that the CI-O-22 + Step 2b/2c
-# patches apply cleanly to. If upstream drifts, refresh both the SHA below
-# and the patches in patches/ together — never bump in isolation.
-ARG LATENTSYNC_WRAPPER_REPO=https://github.com/ShmuelRonen/ComfyUI-LatentSyncWrapper.git
-ARG LATENTSYNC_WRAPPER_REF=main
-# VideoHelperSuite: pin similarly
-ARG VIDEO_HELPER_REPO=https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
-ARG VIDEO_HELPER_REF=main
-
-# --- System deps (build-time only; runtime stage installs runtime libs) ---
+# --- Base apt deps (minimal — base already has python, ffmpeg, libgl, etc.) ---
 RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-        ca-certificates curl git ffmpeg \
-        python3.11 python3.11-dev python3.11-venv python3-pip \
-        build-essential pkg-config \
-        libgl1 libglib2.0-0 \
- && rm -rf /var/lib/apt/lists/* \
- && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
- && update-alternatives --install /usr/bin/python  python  /usr/bin/python3.11 1 \
- && python3 -m pip install --upgrade pip==24.2 setuptools==70.0.0 wheel==0.43.0
+ && apt-get install -y --no-install-recommends ca-certificates curl git \
+ && rm -rf /var/lib/apt/lists/*
 
-# --- ComfyUI ---
-WORKDIR /opt
-RUN git clone --depth 1 --branch ${COMFYUI_REF} ${COMFYUI_REPO} ComfyUI
+# --- Resolve ComfyUI path (same fallback chain as deploy_latentsync_comfyui.sh:108) ---
+# Base image varies between releases — historically /workspace/runpod-slim/ComfyUI,
+# sometimes /workspace/ComfyUI directly. Symlink ensures downstream paths are stable.
+RUN COMFY_DIR="" \
+ && for d in /workspace/ComfyUI /workspace/runpod-slim/ComfyUI /comfyui; do \
+        [ -d "$d" ] && COMFY_DIR="$d" && break; \
+    done \
+ && [ -n "$COMFY_DIR" ] || (echo "FATAL: no ComfyUI dir in base image" && exit 1) \
+ && echo "ComfyUI dir: $COMFY_DIR" \
+ && if [ "$COMFY_DIR" != "/workspace/ComfyUI" ]; then \
+        rm -rf /workspace/ComfyUI 2>/dev/null || true; \
+        ln -s "$COMFY_DIR" /workspace/ComfyUI; \
+    fi
 
-# --- PyTorch stack ---
-# Inherited from the runpod/pytorch:2.4.0 base — DO NOT reinstall torch here.
-# The base ships a tuned wheel (cycle-wala measured ~5min/shot vs 22min on a
-# vanilla pip torch==2.5.1 — the regression is real). torchvision 0.19.0 +
-# torchaudio 2.4.0 come from the base too. CI-O-22 patch still applies (it
-# matches "from torchvision.transforms.functional import" — present in 0.19+).
-
-# --- Strip incompatible base packages (CI-O-58v) ---
-# The runpod/pytorch:2.4.0 base ships numpy 2.x + opencv-{contrib,}-python 4.13
-# (which require numpy>=2). LatentSync's wrapper code uses numpy 1.x APIs and
-# pins numpy==1.26.4 below — that downgrade breaks the pre-installed opencv-*
-# wheels (`cv2 ImportError: numpy.core.multiarray failed to import`), which
-# then crash-loops ComfyUI on container start (v1.6.3 hit this). Uninstall
-# them now so our own opencv-python-headless==4.10.0.84 (numpy 1.x compatible)
-# is the single cv2 provider at runtime.
-RUN pip uninstall -y \
-        opencv-contrib-python \
-        opencv-python \
-        opencv-python-headless || true
-
-# --- ComfyUI requirements ---
-# Skip strict torch pins inside ComfyUI's requirements.txt so they don't bump
-# the base's torch 2.4.0 to 2.5+. The other packages (psutil, kornia, etc.)
-# install fine.
-RUN sed -i -E '/^(torch|torchvision|torchaudio|torchsde)([=<>!]|$)/d' \
-        /opt/ComfyUI/requirements.txt \
- && pip install -r /opt/ComfyUI/requirements.txt
-
-# --- Custom nodes (cloned then pinned to ref) ---
-WORKDIR /opt/ComfyUI/custom_nodes
-RUN git clone ${LATENTSYNC_WRAPPER_REPO} ComfyUI-LatentSyncWrapper \
+# --- Step 1: ComfyUI-LatentSyncWrapper + its deps (mirrors deploy script:130-170) ---
+# IMPORTANT: NO version pins. The deploy script runs `pip install -r
+# requirements.txt`, then `pip install --upgrade torchcodec soundfile`, then
+# `pip install insightface onnxruntime-gpu accelerate`. We do the same.
+ARG LATENTSYNC_WRAPPER_REPO=https://github.com/ShmuelRonen/ComfyUI-LatentSyncWrapper.git
+RUN cd /workspace/ComfyUI/custom_nodes \
+ && git clone --depth 1 "$LATENTSYNC_WRAPPER_REPO" ComfyUI-LatentSyncWrapper \
  && cd ComfyUI-LatentSyncWrapper \
- && git checkout ${LATENTSYNC_WRAPPER_REF} \
- && cd .. \
- && git clone ${VIDEO_HELPER_REPO} ComfyUI-VideoHelperSuite \
+ && pip install --break-system-packages -r requirements.txt \
+ && pip install --break-system-packages --upgrade torchcodec soundfile \
+ && pip install --break-system-packages insightface onnxruntime-gpu accelerate
+
+# --- Step 2: ComfyUI-VideoHelperSuite (mirrors deploy script:240-256) ---
+ARG VIDEO_HELPER_REPO=https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
+RUN cd /workspace/ComfyUI/custom_nodes \
+ && git clone --depth 1 "$VIDEO_HELPER_REPO" ComfyUI-VideoHelperSuite \
  && cd ComfyUI-VideoHelperSuite \
- && git checkout ${VIDEO_HELPER_REF}
+ && pip install --break-system-packages -r requirements.txt
 
-# --- LatentSync wrapper deps + pinned compatibility set ---
-# Strip torch/torchvision/torchaudio pins from the wrapper requirements too —
-# same reason as ComfyUI's requirements.txt above. The wrapper's own deps
-# (mediapipe, librosa, etc.) install cleanly.
-RUN sed -i -E '/^(torch|torchvision|torchaudio|torchsde)([=<>!]|$)/d' \
-        /opt/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/requirements.txt \
- && sed -i -E '/^(torch|torchvision|torchaudio|torchsde)([=<>!]|$)/d' \
-        /opt/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt \
- && pip install -r /opt/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/requirements.txt \
- && pip install -r /opt/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt
-# torchcodec must match the installed torch ABI. torch 2.4.0 → torchcodec 0.3.0
-# (0.4.0 was built for torch 2.5+ and would force an ABI bump that defeats the
-# whole reason we're on the runpod base). soundfile is the fallback audio
-# backend we force on at runtime (TORCHAUDIO_BACKEND=soundfile in entrypoint).
-RUN pip install \
-        torchcodec==0.3.0 \
-        soundfile==0.12.1 \
-        insightface==0.7.3 \
-        onnxruntime-gpu==1.20.1 \
-        accelerate==1.0.1 \
-        diffusers==0.31.0 \
-        transformers==4.44.2 \
-        huggingface_hub==0.25.2 \
-        safetensors==0.4.5 \
-        einops==0.8.0 \
-        omegaconf==2.3.0 \
-        imageio==2.36.0 \
-        imageio-ffmpeg==0.5.1 \
-        opencv-python-headless==4.10.0.84 \
-        librosa==0.10.2.post1 \
-        scipy==1.13.1 \
-        numpy==1.26.4 \
-        Pillow==10.4.0
-
-# --- Postprocess deps (full chain: GFPGAN + Feathered + CodeFormer) ---
-# basicsr ships a stale `from torchvision.transforms.functional_tensor import
-# rgb_to_grayscale` import that's been removed in tv >= 0.17. Sed-fix it after
-# install so gfpgan can import cleanly.
-RUN pip install \
-        basicsr==1.4.2 \
-        facexlib==0.3.0 \
-        gfpgan==1.3.8 \
-        lpips==0.1.4 \
-        realesrgan==0.3.0 \
-        'mediapipe<0.10.15' \
-        fastapi==0.109.0 \
-        'uvicorn[standard]==0.27.0' \
-        python-multipart==0.0.6 \
- && DEG=$(python3 -c "import importlib.util, os; s=importlib.util.find_spec('basicsr'); print(os.path.join(os.path.dirname(s.origin), 'data', 'degradations.py'))") \
- && sed -i 's|from torchvision.transforms.functional_tensor import rgb_to_grayscale|from torchvision.transforms.functional import rgb_to_grayscale|' "$DEG" \
- && python3 -c "import gfpgan; import basicsr.data.degradations; import mediapipe; print('postproc deps OK')"
-
-# --- Apply patches: CI-O-22 (write_video + read_video imageio), no-face, cv2 fallback ---
+# --- Step 2b/2c/2d: Apply LatentSync patches (no-face, CI-O-22, CI-O-22c) ---
 COPY patches/ /tmp/patches/
 RUN python3 /tmp/patches/patch_ci_o_22_write_video.py \
-        /opt/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper \
+        /workspace/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper \
  && python3 /tmp/patches/patch_no_face_graceful.py \
-        /opt/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper \
+        /workspace/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper \
  && python3 /tmp/patches/patch_latentsync_read_video.py \
-        /opt/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper
+        /workspace/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper
 
-# Fail the build LOUD if any patch silently no-op'd. Far better than building
-# a broken image that crashes on every dialogue lipsync at runtime.
-RUN grep -q "CI-O-22 PATCH APPLIED" /opt/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/nodes.py \
-        || (echo "FATAL: CI-O-22 patch did not apply to nodes.py" && exit 1) \
- && grep -q "CI-O-22c" /opt/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/nodes.py \
-        || (echo "FATAL: CI-O-22c (read_video imageio) marker missing" && exit 1) \
- && grep -q "no_face_indices" /opt/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/latentsync/pipelines/lipsync_pipeline.py \
+# Build-time verification — fail LOUDLY if any patch silently no-op'd.
+RUN grep -q "CI-O-22 PATCH APPLIED" /workspace/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/nodes.py \
+        || (echo "FATAL: CI-O-22 patch did not apply" && exit 1) \
+ && grep -q "CI-O-22c" /workspace/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/nodes.py \
+        || (echo "FATAL: CI-O-22c marker missing" && exit 1) \
+ && grep -q "no_face_indices" /workspace/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/latentsync/pipelines/lipsync_pipeline.py \
         || (echo "FATAL: no-face patch did not apply to lipsync_pipeline.py" && exit 1) \
- && grep -q "return None, None, None" /opt/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/latentsync/utils/image_processor.py \
+ && grep -q "return None, None, None" /workspace/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/latentsync/utils/image_processor.py \
         || (echo "FATAL: no-face patch A did not apply to image_processor.py" && exit 1)
 
-# --- Checkpoint directory layout ---
-ENV CKPT=/opt/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/checkpoints
-RUN mkdir -p "$CKPT/whisper" "$CKPT/vae" \
-        /opt/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/auxiliary \
-        /opt/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/.cache
-
-# --- LatentSync core checkpoints (~7 GB) ---
-# Each download enforces a minimum size check — if HF returns an HTML error
-# page or a partial transfer, we'd otherwise bake a corrupt image. Better to
-# fail the build than ship 10 GB of lies.
+# --- Step 5: LatentSync core checkpoints (mirrors deploy script:540-571) ---
+# Each download enforces a minimum size — fail the build than ship a corrupt image.
+ENV CKPT=/workspace/ComfyUI/custom_nodes/ComfyUI-LatentSyncWrapper/checkpoints
+RUN mkdir -p "$CKPT/whisper" "$CKPT/vae"
 RUN curl -fL --retry 5 --retry-delay 10 --max-time 1800 \
         -o "$CKPT/latentsync_unet.pt" \
         'https://huggingface.co/ByteDance/LatentSync-1.6/resolve/main/latentsync_unet.pt' \
@@ -229,7 +137,7 @@ RUN curl -fL --retry 5 --retry-delay 10 --max-time 60 \
         -o "$CKPT/latentsync_config.json" \
         'https://huggingface.co/ByteDance/LatentSync-1.6/resolve/main/config.json'
 
-# --- VAE: directory format (config + safetensors) so AutoencoderKL.from_pretrained works ---
+# --- Step 1b: VAE in directory format (mirrors deploy script:172-238) ---
 RUN curl -fL --retry 5 --retry-delay 10 --max-time 60 \
         -o "$CKPT/vae/config.json" \
         'https://huggingface.co/stabilityai/sd-vae-ft-mse/resolve/main/config.json' \
@@ -239,7 +147,26 @@ RUN curl -fL --retry 5 --retry-delay 10 --max-time 60 \
  && [ "$(stat -c%s $CKPT/vae/diffusion_pytorch_model.safetensors)" -gt 300000000 ] \
         || (echo "FATAL: VAE safetensors too small" && exit 1)
 
-# --- CodeFormer + facelib weights (postprocess sidecar) ---
+# --- Step 6: Post-processing tools (mirrors deploy script:573-625) ---
+# IMPORTANT: deploy script uses `pip install --break-system-packages basicsr
+# facexlib gfpgan lpips realesrgan 'mediapipe<0.10.15'`. NO other version pins.
+RUN pip install --break-system-packages \
+        basicsr facexlib gfpgan lpips realesrgan 'mediapipe<0.10.15' \
+        fastapi uvicorn python-multipart
+
+# basicsr torchvision compat sed-fix (mirrors deploy script:590-594).
+# Find the file via `find /usr -path '*/basicsr/data/degradations.py'` since
+# basicsr might land in /usr/lib or /usr/local/lib depending on pip's choice.
+RUN DEG=$(find /usr -path '*/basicsr/data/degradations.py' 2>/dev/null | head -1) \
+ && if [ -n "$DEG" ] && grep -q 'from torchvision.transforms.functional_tensor import rgb_to_grayscale' "$DEG" 2>/dev/null; then \
+        sed -i 's|from torchvision.transforms.functional_tensor import rgb_to_grayscale|from torchvision.transforms.functional import rgb_to_grayscale|' "$DEG"; \
+        echo "  Patched basicsr torchvision compat at $DEG"; \
+    else \
+        echo "  basicsr already patched or import path differs (DEG=$DEG)"; \
+    fi \
+ && python3 -c "import gfpgan; import basicsr.data.degradations; import mediapipe; print('postproc deps OK')"
+
+# --- CodeFormer + facelib weights (mirrors deploy script:600-610) ---
 RUN git clone --depth 1 https://github.com/sczhou/CodeFormer.git /workspace/CodeFormer \
  && printf '__version__ = "0.1.0"\n__gitsha__ = "unknown"\n' > /workspace/CodeFormer/basicsr/version.py \
  && mkdir -p /workspace/CodeFormer/weights/CodeFormer /workspace/CodeFormer/weights/facelib \
@@ -250,61 +177,16 @@ RUN git clone --depth 1 https://github.com/sczhou/CodeFormer.git /workspace/Code
  && curl -fL --retry 5 -o /workspace/CodeFormer/weights/facelib/parsing_parsenet.pth \
         'https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/parsing_parsenet.pth'
 
-# --- GFPGAN weights ---
+# --- GFPGAN weights (mirrors deploy script:613-615) ---
 RUN mkdir -p /workspace/gfpgan_weights \
  && curl -fL --retry 5 --retry-delay 10 --max-time 600 \
         -o /workspace/gfpgan_weights/GFPGANv1.4.pth \
         'https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth'
 
-# -----------------------------------------------------------------------------
-# Stage 2 — runtime: same runpod/pytorch base for ABI parity with builder
-#
-# Using the runpod/pytorch base in BOTH stages means the tuned torch 2.4.0
-# wheel from the builder's /usr/local/lib/python3.11/dist-packages copies in
-# clean — no version mismatch with a different runtime base. The base is
-# already cached on most runpod hosts (it's their default pytorch worker
-# image), so first-pull cost is ~equivalent to cuda:12.4.1-runtime.
-# -----------------------------------------------------------------------------
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04 AS runtime
-
-ARG DEBIAN_FRONTEND=noninteractive
-
-LABEL org.opencontainers.image.title="onshot-lipsync-latentsync"
-LABEL org.opencontainers.image.description="OnShot lipsync pod — ComfyUI + LatentSync 1.6 + post-processing sidecar, fully baked"
-LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/kg-storytelling-platform"
-LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.6.5"
-LABEL onshot.role="lipsync"
-LABEL onshot.engine="latentsync-1.6"
-
-# Runtime apt deps. ffmpeg / libgl / etc. — the runpod base has python 3.11
-# already, so we don't reinstall it.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-        ca-certificates curl ffmpeg \
-        libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
- && rm -rf /var/lib/apt/lists/*
-
-# Copy ONLY the pip-installed extras (everything our builder added on top of
-# the base). /usr/local/lib/python3.11/dist-packages contains both the base's
-# tuned torch + all our extra wheels, so a single COPY is correct.
-COPY --from=builder /usr/local/lib/python3.11/dist-packages /usr/local/lib/python3.11/dist-packages
-
-# Copy ComfyUI tree (includes patched custom_nodes + all checkpoints)
-COPY --from=builder /opt/ComfyUI /opt/ComfyUI
-
-# Copy CodeFormer + GFPGAN weights into /workspace
-COPY --from=builder /workspace/CodeFormer /workspace/CodeFormer
-COPY --from=builder /workspace/gfpgan_weights /workspace/gfpgan_weights
-
-# Copy postprocess server + entrypoint
+# --- Postprocess server + entrypoint ---
 COPY api_server_postprocess.py /opt/api_server_postprocess.py
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
-
-# Working dir for runtime artefacts (logs, postprocess_tmp)
-RUN mkdir -p /workspace
-WORKDIR /workspace
 
 # CI-O-21 safety net: torchaudio.save() uses soundfile backend
 ENV TORCHAUDIO_USE_BACKEND_DISPATCHER=1 \
@@ -312,7 +194,16 @@ ENV TORCHAUDIO_USE_BACKEND_DISPATCHER=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+LABEL org.opencontainers.image.title="onshot-lipsync-latentsync"
+LABEL org.opencontainers.image.description="OnShot lipsync pod — ComfyUI + LatentSync 1.6 + post-processing sidecar, fully baked"
+LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/onshot-docker"
+LABEL org.opencontainers.image.licenses="proprietary"
+LABEL org.opencontainers.image.version="1.6.6"
+LABEL onshot.role="lipsync"
+LABEL onshot.engine="latentsync-1.6"
+
 # Ports: 8188 = ComfyUI, 8000 = postprocess sidecar
 EXPOSE 8188 8000
+WORKDIR /workspace
 
 ENTRYPOINT ["/entrypoint.sh"]
