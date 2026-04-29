@@ -134,6 +134,68 @@ COPY patches/patch_audiocraft_xformers.py /tmp/patches/patch_audiocraft_xformers
 RUN python3 /tmp/patches/patch_audiocraft_xformers.py \
  && python3 -c "import audiocraft.modules.transformer; print('audiocraft import OK after xformers patch')"
 
+# --- Step 5c: Pre-download T5 tokenizers (CI-O-FISH-1) ---
+# audiocraft's MusicGen + AudioGen call `T5Tokenizer.from_pretrained("t5-base")`
+# at construction time (audiocraft/modules/conditioners.py:415). The legacy
+# "t5-base" / "t5-large" repo names were renamed on HF to "google-t5/t5-base"
+# and "google-t5/t5-large"; the redirect can be flaky on GHA runners (clean
+# HF cache + rate limits → 404). The deploy script doesn't hit this because
+# the runpod base image has these cached from prior pulls.
+#
+# Fix: explicit snapshot_download with retries, then symlink the legacy
+# cache name to the canonical one so transformers' `from_pretrained` finds
+# the local copy without hitting Hub. This makes the t5 fetch a one-time
+# build cost instead of a runtime risk.
+ENV HF_HOME=/workspace/models \
+    HF_HUB_DOWNLOAD_TIMEOUT=120
+RUN mkdir -p /workspace/models
+RUN python3 - <<'PYEOF'
+import os, pathlib, sys, time
+from huggingface_hub import snapshot_download
+
+cache_root = pathlib.Path("/workspace/models/hub")
+cache_root.mkdir(parents=True, exist_ok=True)
+
+def fetch(legacy, canonical):
+    """Download `canonical` then symlink legacy cache name → canonical."""
+    print(f"=== fetching {canonical} (legacy alias: {legacy}) ===", flush=True)
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            snapshot_download(
+                repo_id=canonical,
+                cache_dir=str(cache_root),
+                allow_patterns=[
+                    "*.json", "*.txt", "*.model", "spiece.model",
+                    "tokenizer.json", "tokenizer_config.json",
+                    "special_tokens_map.json", "added_tokens.json",
+                    "config.json", "generation_config.json",
+                    "*.safetensors", "*.bin", "*.pt",
+                ],
+            )
+            print(f"  OK on attempt {attempt}", flush=True)
+            break
+        except Exception as e:
+            last_err = e
+            print(f"  attempt {attempt} failed: {e}", flush=True)
+            time.sleep(5 * attempt)
+    else:
+        raise RuntimeError(f"Failed to download {canonical}: {last_err}")
+    legacy_dir = cache_root / f"models--{legacy.replace('/', '--')}"
+    canonical_dir = cache_root / f"models--{canonical.replace('/', '--')}"
+    if canonical_dir.exists() and not legacy_dir.exists():
+        legacy_dir.symlink_to(canonical_dir)
+        print(f"  symlink: {legacy_dir.name} → {canonical_dir.name}", flush=True)
+
+fetch("t5-base",  "google-t5/t5-base")
+fetch("t5-large", "google-t5/t5-large")
+
+# Sanity: transformers should now find the legacy name in cache.
+from transformers import T5Tokenizer
+tok = T5Tokenizer.from_pretrained("t5-base")
+print(f"  T5Tokenizer.from_pretrained('t5-base') OK ({tok.vocab_size} tokens)", flush=True)
+PYEOF
+
 # --- Step 6: Pre-download MusicGen Medium + AudioGen Medium ---
 # The deploy script uses MusicGen.get_pretrained() / AudioGen.get_pretrained()
 # which downloads to HF_HOME. Bake the cache so first request doesn't pay
@@ -200,7 +262,7 @@ LABEL org.opencontainers.image.title="onshot-fish-audio"
 LABEL org.opencontainers.image.description="OnShot fish-audio pod — MusicGen Medium (BGM) + AudioGen Medium (SFX), fully baked"
 LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/onshot-docker"
 LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.0.1"
+LABEL org.opencontainers.image.version="1.0.2"
 LABEL onshot.role="audio"
 LABEL onshot.engine="fish-audiocraft"
 
