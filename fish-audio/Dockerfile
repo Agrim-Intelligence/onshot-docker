@@ -122,6 +122,18 @@ RUN pip install --break-system-packages --no-cache-dir \
 RUN pip install --break-system-packages --no-cache-dir --force-reinstall \
         numpy==1.26.4
 
+# --- Step 5b: Patch audiocraft for xformers-free operation ---
+# audiocraft 1.3.0 hard-imports `from xformers import ops` at module load.
+# There is no stable xformers wheel for torch 2.8 + Python 3.12, so we
+# make that import optional and fall back to torch attention. Without
+# this, the very next step (`from audiocraft.models import MusicGen`)
+# raises ModuleNotFoundError and the whole build fails.
+# Verbatim port of deploy_fish.sh:309-380 — same patches, same files,
+# idempotent. Build fails LOUDLY if either patch silently no-ops.
+COPY patches/patch_audiocraft_xformers.py /tmp/patches/patch_audiocraft_xformers.py
+RUN python3 /tmp/patches/patch_audiocraft_xformers.py \
+ && python3 -c "import audiocraft.modules.transformer; print('audiocraft import OK after xformers patch')"
+
 # --- Step 6: Pre-download MusicGen Medium + AudioGen Medium ---
 # The deploy script uses MusicGen.get_pretrained() / AudioGen.get_pretrained()
 # which downloads to HF_HOME. Bake the cache so first request doesn't pay
@@ -188,7 +200,7 @@ LABEL org.opencontainers.image.title="onshot-fish-audio"
 LABEL org.opencontainers.image.description="OnShot fish-audio pod — MusicGen Medium (BGM) + AudioGen Medium (SFX), fully baked"
 LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/onshot-docker"
 LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.version="1.0.1"
 LABEL onshot.role="audio"
 LABEL onshot.engine="fish-audiocraft"
 
