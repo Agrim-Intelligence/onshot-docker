@@ -147,7 +147,14 @@ RUN python3 /tmp/patches/patch_audiocraft_xformers.py \
 # the local copy without hitting Hub. This makes the t5 fetch a one-time
 # build cost instead of a runtime risk.
 ENV HF_HOME=/workspace/models \
-    HF_HUB_DOWNLOAD_TIMEOUT=120
+    HF_HUB_DOWNLOAD_TIMEOUT=120 \
+    HF_HUB_ENABLE_HF_TRANSFER=0
+# CI-O-FISH-2: runpod/pytorch:1.0.2 base sets HF_HUB_ENABLE_HF_TRANSFER=1
+# but doesn't install hf_transfer, so snapshot_download fails immediately
+# with "Fast download using 'hf_transfer' is enabled but package missing".
+# Override the env var (above) AND install hf_transfer (below) so both
+# the slow + fast paths work, regardless of whether the env wins.
+RUN pip install --break-system-packages --no-cache-dir hf_transfer
 RUN mkdir -p /workspace/models
 RUN python3 - <<'PYEOF'
 import os, pathlib, sys, time
@@ -262,7 +269,7 @@ LABEL org.opencontainers.image.title="onshot-fish-audio"
 LABEL org.opencontainers.image.description="OnShot fish-audio pod — MusicGen Medium (BGM) + AudioGen Medium (SFX), fully baked"
 LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/onshot-docker"
 LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.0.2"
+LABEL org.opencontainers.image.version="1.0.3"
 LABEL onshot.role="audio"
 LABEL onshot.engine="fish-audiocraft"
 

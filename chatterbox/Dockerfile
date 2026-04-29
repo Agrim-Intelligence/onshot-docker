@@ -95,7 +95,14 @@ RUN python3 -c "from chatterbox.mtl_tts import ChatterboxMultilingualTTS; print(
 ENV HF_HOME=/workspace/models \
     TORCH_HOME=/workspace/models \
     TRANSFORMERS_CACHE=/workspace/models \
-    HF_HUB_DOWNLOAD_TIMEOUT=120
+    HF_HUB_DOWNLOAD_TIMEOUT=120 \
+    HF_HUB_ENABLE_HF_TRANSFER=0
+# CI-O-CHATTER-1: runpod base sets HF_HUB_ENABLE_HF_TRANSFER=1 but does
+# not install hf_transfer, so snapshot_download fails immediately with
+# "Fast download using 'hf_transfer' is enabled but package missing".
+# Override the env var (above) AND install hf_transfer (below) so both
+# the slow + fast paths work, regardless of whether the env wins.
+RUN pip install --break-system-packages --no-cache-dir hf_transfer
 RUN mkdir -p /workspace/models /opt /tmp/audio-outputs /root/audio-logs
 RUN python3 - <<'PYEOF'
 import os, pathlib, sys, time
@@ -172,7 +179,7 @@ LABEL org.opencontainers.image.title="onshot-chatterbox-multilingual"
 LABEL org.opencontainers.image.description="OnShot chatterbox-multilingual TTS pod — Hindi/multilingual TTS + zero-shot voice cloning, fully baked"
 LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/onshot-docker"
 LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.version="1.0.1"
 LABEL onshot.role="audio"
 LABEL onshot.engine="chatterbox-multilingual"
 
