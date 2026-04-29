@@ -203,52 +203,105 @@ tok = T5Tokenizer.from_pretrained("t5-base")
 print(f"  T5Tokenizer.from_pretrained('t5-base') OK ({tok.vocab_size} tokens)", flush=True)
 PYEOF
 
-# --- Step 6: Pre-download MusicGen Medium + AudioGen Medium ---
-# The deploy script uses MusicGen.get_pretrained() / AudioGen.get_pretrained()
-# which downloads to HF_HOME. Bake the cache so first request doesn't pay
-# the ~6 GB download. Verify size after each call.
+# --- Step 6a: Pre-download MusicGen Medium (CI-O-FISH-3 v1.0.4) ---
+# v1.0.3 baked MusicGen + AudioGen in ONE RUN, producing a single 6.76 GB
+# layer. Docker can't parallelize WITHIN a layer, so on a typical 50 MB/s
+# GHCR pull this single blob takes 2+ min — and on a throttled host it
+# stalls indefinitely (the chatterbox v1.0.2 9.7 GB layer hung 4 hosts).
+# Splitting the download into separate RUNs gives each its own layer:
+# Docker pulls them in parallel (default 3 concurrent), wall-clock pull
+# time drops by ~50%.
 ENV HF_HOME=/workspace/models \
     TORCH_HOME=/workspace/models
 RUN mkdir -p /workspace/models /opt /workspace/audio-server /tmp/audio-outputs
 RUN python3 - <<'PYEOF'
 import os, sys
 os.environ.setdefault("HF_HOME", "/workspace/models")
-from audiocraft.models import MusicGen, AudioGen
+from audiocraft.models import MusicGen
 print("Downloading MusicGen Medium...", flush=True)
 m = MusicGen.get_pretrained("facebook/musicgen-medium")
 del m
+print("MusicGen Medium downloaded", flush=True)
+PYEOF
+
+# --- Step 6b: Pre-download AudioGen Medium (separate layer) ---
+RUN python3 - <<'PYEOF'
+import os, sys
+os.environ.setdefault("HF_HOME", "/workspace/models")
+from audiocraft.models import AudioGen
 print("Downloading AudioGen Medium...", flush=True)
 a = AudioGen.get_pretrained("facebook/audiogen-medium")
 del a
+print("AudioGen Medium downloaded", flush=True)
+PYEOF
 
-# t5-large cache name drift (deploy_fish.sh:484-490): symlink old → new
-import pathlib
+# --- Step 6c: Slim HF cache + verify (CI-O-FISH-4 v1.0.4) ---
+# Same slim treatment as chatterbox v1.0.3:
+#   1. Resolve every snapshot symlink to a real file (in-place rewrite).
+#   2. Delete blobs/ — Docker's overlay would otherwise store both the
+#      symlink target AND the symlink itself, doubling effective size.
+#   3. Drop .huggingface/ metadata + .lock / .partial leftovers.
+#   4. t5-large legacy-name symlink (deploy_fish.sh:484-490 contract).
+#   5. Verify total size + that both models actually landed.
+RUN python3 - <<'PYEOF'
+import os, pathlib, shutil, sys
+
 hub = pathlib.Path("/workspace/models/hub")
+
+# t5-large cache name drift symlink (legacy contract)
 old = hub / "models--t5-large"
 new = hub / "models--google-t5--t5-large"
 if new.exists() and not old.exists():
     old.symlink_to(new)
-    print("t5-large symlink created")
+    print("t5-large legacy symlink created")
 
-# Verify both models landed (>2GB each).
-def check(pattern, min_size):
-    for d in os.listdir(hub):
-        if pattern in d:
-            total = sum(
-                os.path.getsize(os.path.join(root, f))
-                for root, _, files in os.walk(hub / d)
-                for f in files if not os.path.islink(os.path.join(root, f))
-            )
-            print(f"  {d}: {total / 1024 / 1024:.0f} MB")
-            return total >= min_size
-    return False
+# Slim each model's snapshots/blobs
+for model_dir in hub.glob("models--*"):
+    if model_dir.is_symlink():
+        continue
+    snap_root = model_dir / "snapshots"
+    if snap_root.is_dir():
+        for snap in snap_root.iterdir():
+            for f in snap.iterdir():
+                if f.is_symlink():
+                    target = f.resolve()
+                    if target.is_file():
+                        f.unlink()
+                        shutil.copy2(str(target), str(f))
+    blobs = model_dir / "blobs"
+    if blobs.is_dir():
+        sz = sum(p.stat().st_size for p in blobs.rglob("*") if p.is_file())
+        shutil.rmtree(str(blobs))
+        print(f"  removed {model_dir.name}/blobs/ ({sz / 1024 / 1024:.0f} MB freed)")
 
-ok_bgm = check("facebook--musicgen-medium", 2_000_000_000)
-ok_sfx = check("facebook--audiogen-medium", 2_000_000_000)
-if not (ok_bgm and ok_sfx):
-    print("FATAL: model download incomplete", file=sys.stderr)
+# Cleanup metadata + leftover lock/partial files
+hf_meta = hub / ".huggingface"
+if hf_meta.is_dir():
+    shutil.rmtree(str(hf_meta))
+    print("removed .huggingface/ metadata")
+for p in hub.rglob("*.lock"):
+    p.unlink()
+for p in hub.rglob("*.partial"):
+    p.unlink()
+
+# Verify both models landed
+def model_size(pattern):
+    for d in hub.iterdir():
+        if d.is_symlink():
+            continue
+        if pattern in d.name:
+            return sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
+    return 0
+
+bgm_size = model_size("facebook--musicgen-medium")
+sfx_size = model_size("facebook--audiogen-medium")
+print(f"MusicGen Medium: {bgm_size / 1024 / 1024:.0f} MB")
+print(f"AudioGen Medium: {sfx_size / 1024 / 1024:.0f} MB")
+if bgm_size < 1_500_000_000 or sfx_size < 1_500_000_000:
+    print("FATAL: model size below threshold", file=sys.stderr)
     sys.exit(1)
-print("All models baked OK")
+total = sum(p.stat().st_size for p in hub.rglob("*") if p.is_file())
+print(f"final hub size: {total / 1024 / 1024:.0f} MB")
 PYEOF
 
 # --- Bake the api_server + entrypoint ---
@@ -269,7 +322,7 @@ LABEL org.opencontainers.image.title="onshot-fish-audio"
 LABEL org.opencontainers.image.description="OnShot fish-audio pod — MusicGen Medium (BGM) + AudioGen Medium (SFX), fully baked"
 LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/onshot-docker"
 LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.0.3"
+LABEL org.opencontainers.image.version="1.0.4"
 LABEL onshot.role="audio"
 LABEL onshot.engine="fish-audiocraft"
 
