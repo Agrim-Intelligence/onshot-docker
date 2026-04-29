@@ -47,11 +47,14 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Single stage on runpod/pytorch:2.6.1-py3.11-cuda12.4.1-devel-ubuntu22.04
-# (the recommended image from deploy_chatterbox.sh:8). chatterbox needs
-# torch >= 2.6 and CUDA 12.x — the runpod base ships both pre-tuned.
+# Single stage on runpod/pytorch:1.0.3-cu1281-torch260-ubuntu2404. The tag
+# in deploy_chatterbox.sh:8 ("2.6.1-py3.11-cuda12.4.1-devel-ubuntu22.04")
+# refers to the OLD runpod tag scheme and was unpublished by runpod when
+# they switched to the "<runpod-ver>-cu<cuda>-torch<torch>-ubuntu<distro>"
+# format. This tag matches the same intent (torch 2.6 + CUDA 12.8) under
+# the new naming and is part of the same family fish-audio v1.0.x uses.
 # -----------------------------------------------------------------------------
-FROM runpod/pytorch:2.6.1-py3.11-cuda12.4.1-devel-ubuntu22.04
+FROM runpod/pytorch:1.0.3-cu1281-torch260-ubuntu2404
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG PYTHONDONTWRITEBYTECODE=1
@@ -179,7 +182,7 @@ LABEL org.opencontainers.image.title="onshot-chatterbox-multilingual"
 LABEL org.opencontainers.image.description="OnShot chatterbox-multilingual TTS pod — Hindi/multilingual TTS + zero-shot voice cloning, fully baked"
 LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/onshot-docker"
 LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.0.1"
+LABEL org.opencontainers.image.version="1.0.2"
 LABEL onshot.role="audio"
 LABEL onshot.engine="chatterbox-multilingual"
 
