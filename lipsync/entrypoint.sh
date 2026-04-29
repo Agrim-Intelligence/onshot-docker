@@ -14,7 +14,12 @@
 # inspection, etc). Without this, a runtime import error (e.g. cv2/numpy ABI
 # mismatch) crash-loops the container forever — no SSH, no port proxy,
 # nothing to grab logs from.
-set -e
+# NB: NO `set -e` — a failed `cd` to a missing dir would otherwise exit the
+# container before sleep-infinity, which is exactly the v1.6.6 crash-loop bug:
+# entrypoint hard-coded `cd /opt/ComfyUI` but the build cloned ComfyUI to
+# /workspace/ComfyUI when find didn't locate it in the runpod/comfyui base.
+# We resolve the path dynamically below and tolerate failures so the
+# diagnostic preflight + sleep-infinity tail always run.
 
 mkdir -p /workspace
 cd /workspace
@@ -22,6 +27,38 @@ cd /workspace
 # CI-O-21 safety net (also baked into Dockerfile ENV, kept here for clarity).
 export TORCHAUDIO_USE_BACKEND_DISPATCHER=1
 export TORCHAUDIO_BACKEND=soundfile
+
+# --- Start sshd if available (runpod/comfyui base ships sshd but its own
+# entrypoint starts it — we overrode that, so do it ourselves). Inject the
+# RunPod-supplied PUBLIC_KEY into root's authorized_keys so the operator can
+# SSH in for log inspection. Without this, all the "sleep infinity" debug
+# affordance below is unreachable.
+if [ -n "$PUBLIC_KEY" ]; then
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+    echo "$PUBLIC_KEY" > /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+fi
+if command -v sshd >/dev/null 2>&1; then
+    mkdir -p /run/sshd
+    # Generate host keys if missing (fresh container).
+    [ -f /etc/ssh/ssh_host_rsa_key ] || ssh-keygen -A 2>/dev/null || true
+    /usr/sbin/sshd -D > /workspace/sshd.log 2>&1 &
+    echo "[entrypoint] sshd started (pid=$!)"
+fi
+
+# Resolve ComfyUI dir at boot. Build-time clone landed at /workspace/ComfyUI
+# (the find fallback in Dockerfile). If a runtime install populates a
+# different path (e.g. /workspace/runpod-slim/ComfyUI), prefer that.
+COMFY_DIR=""
+for d in /workspace/ComfyUI /workspace/runpod-slim/ComfyUI /opt/ComfyUI /comfyui; do
+    if [ -f "$d/main.py" ]; then COMFY_DIR="$d"; break; fi
+done
+if [ -z "$COMFY_DIR" ]; then
+    COMFY_DIR=$(find / -maxdepth 5 -type f -name main.py -path '*/ComfyUI/main.py' 2>/dev/null | head -1)
+    [ -n "$COMFY_DIR" ] && COMFY_DIR=$(dirname "$COMFY_DIR")
+fi
+echo "[entrypoint] ComfyUI dir resolved: ${COMFY_DIR:-<NOT FOUND>}"
 
 # --- Pre-flight import checks (CI-O-58w) ---
 # Validate the runtime stack BEFORE we kick off the heavy services. Any
@@ -52,31 +89,45 @@ PYEOF
 echo "[entrypoint] preflight done; see /workspace/preflight.log"
 
 # --- Start ComfyUI on :8188 ---
-cd /opt/ComfyUI
-python3 main.py \
-    --listen 0.0.0.0 \
-    --port 8188 \
-    --enable-cors-header \
-    --disable-auto-launch \
-    > /workspace/comfyui.log 2>&1 &
-COMFY_PID=$!
+if [ -n "$COMFY_DIR" ] && [ -f "$COMFY_DIR/main.py" ]; then
+    cd "$COMFY_DIR"
+    python3 main.py \
+        --listen 0.0.0.0 \
+        --port 8188 \
+        --enable-cors-header \
+        --disable-auto-launch \
+        > /workspace/comfyui.log 2>&1 &
+    COMFY_PID=$!
+else
+    echo "[entrypoint] FATAL: ComfyUI main.py not found anywhere — starting in degraded mode (sleep only). preflight.log will show what the image contains." \
+        > /workspace/comfyui.log
+    COMFY_PID=""
+fi
 
 # --- Start postprocess sidecar on :8000 ---
 nohup python3 /opt/api_server_postprocess.py \
     > /workspace/postprocess.log 2>&1 &
 POSTPROC_PID=$!
 
-echo "[entrypoint] ComfyUI pid=$COMFY_PID, Postprocess pid=$POSTPROC_PID"
+echo "[entrypoint] ComfyUI pid=${COMFY_PID:-<none>}, Postprocess pid=${POSTPROC_PID:-<none>}"
 
-# Stream both logs to container stdout so `docker logs` shows them live.
-tail -F /workspace/comfyui.log /workspace/postprocess.log /workspace/preflight.log &
+# Stream all three logs to container stdout so `docker logs` shows them live.
+tail -F /workspace/comfyui.log /workspace/postprocess.log /workspace/preflight.log 2>/dev/null &
 TAIL_PID=$!
 
 # Wait on either real server dying (ignore the tail — it lives forever).
 # `wait -n` returns when the first job exits; we DO NOT propagate that as a
 # container exit, so SSH stays up for debugging.
-wait -n $COMFY_PID $POSTPROC_PID
-EXIT_CODE=$?
+PIDS=""
+[ -n "$COMFY_PID" ] && PIDS="$PIDS $COMFY_PID"
+[ -n "$POSTPROC_PID" ] && PIDS="$PIDS $POSTPROC_PID"
+if [ -n "$PIDS" ]; then
+    wait -n $PIDS
+    EXIT_CODE=$?
+else
+    EXIT_CODE=255
+    echo "[entrypoint] no servers started — degraded mode"
+fi
 
 echo "[entrypoint] one of the servers exited (code=$EXIT_CODE); container will sleep" \
      "indefinitely so SSH + log inspection stay available. Inspect" \
