@@ -155,107 +155,135 @@ ENV HF_HOME=/workspace/models \
 # Override the env var (above) AND install hf_transfer (below) so both
 # the slow + fast paths work, regardless of whether the env wins.
 RUN pip install --break-system-packages --no-cache-dir hf_transfer
-RUN mkdir -p /workspace/models
-RUN python3 - <<'PYEOF'
-import os, pathlib, sys, time
-from huggingface_hub import snapshot_download
-
-cache_root = pathlib.Path("/workspace/models/hub")
-cache_root.mkdir(parents=True, exist_ok=True)
-
-def fetch(legacy, canonical):
-    """Download `canonical` then symlink legacy cache name → canonical."""
-    print(f"=== fetching {canonical} (legacy alias: {legacy}) ===", flush=True)
-    last_err = None
-    for attempt in range(1, 4):
-        try:
-            snapshot_download(
-                repo_id=canonical,
-                cache_dir=str(cache_root),
-                allow_patterns=[
-                    "*.json", "*.txt", "*.model", "spiece.model",
-                    "tokenizer.json", "tokenizer_config.json",
-                    "special_tokens_map.json", "added_tokens.json",
-                    "config.json", "generation_config.json",
-                    "*.safetensors", "*.bin", "*.pt",
-                ],
-            )
-            print(f"  OK on attempt {attempt}", flush=True)
-            break
-        except Exception as e:
-            last_err = e
-            print(f"  attempt {attempt} failed: {e}", flush=True)
-            time.sleep(5 * attempt)
-    else:
-        raise RuntimeError(f"Failed to download {canonical}: {last_err}")
-    legacy_dir = cache_root / f"models--{legacy.replace('/', '--')}"
-    canonical_dir = cache_root / f"models--{canonical.replace('/', '--')}"
-    if canonical_dir.exists() and not legacy_dir.exists():
-        legacy_dir.symlink_to(canonical_dir)
-        print(f"  symlink: {legacy_dir.name} → {canonical_dir.name}", flush=True)
-
-fetch("t5-base",  "google-t5/t5-base")
-fetch("t5-large", "google-t5/t5-large")
-
-# Sanity: transformers should now find the legacy name in cache.
-from transformers import T5Tokenizer
-tok = T5Tokenizer.from_pretrained("t5-base")
-print(f"  T5Tokenizer.from_pretrained('t5-base') OK ({tok.vocab_size} tokens)", flush=True)
-PYEOF
-
-# --- Step 6a: Pre-download MusicGen Medium (CI-O-FISH-3 v1.0.4) ---
-# v1.0.3 baked MusicGen + AudioGen in ONE RUN, producing a single 6.76 GB
-# layer. Docker can't parallelize WITHIN a layer, so on a typical 50 MB/s
-# GHCR pull this single blob takes 2+ min — and on a throttled host it
-# stalls indefinitely (the chatterbox v1.0.2 9.7 GB layer hung 4 hosts).
-# Splitting the download into separate RUNs gives each its own layer:
-# Docker pulls them in parallel (default 3 concurrent), wall-clock pull
-# time drops by ~50%.
+RUN mkdir -p /workspace/models /opt /workspace/audio-server /tmp/audio-outputs
 ENV HF_HOME=/workspace/models \
     TORCH_HOME=/workspace/models
-RUN mkdir -p /workspace/models /opt /workspace/audio-server /tmp/audio-outputs
+
+# CI-O-FISH-5 (v1.0.5): inline the slim into the SAME RUN as each download.
+# v1.0.4 ran download + slim in separate RUNs and the image grew to 30 GB
+# (vs 20 GB on v1.0.3) because Docker overlay cannot delete files from a
+# previous layer — the slim's `shutil.rmtree(blobs)` only writes whiteout
+# markers; the bytes still live in the prior download layer. To actually
+# slim, the download + symlink-resolve + blobs/ delete must all happen in
+# the SAME RUN so the layer commits the FINAL state directly.
+#
+# Per-model RUN (one layer each, naturally parallel-pull-friendly):
+#   t5-base:        ~250 MB  (tokenizer + model)
+#   t5-large:       ~3 GB    (the bigger T5)
+#   MusicGen Med:   ~1.7 GB  (UNet + encodec, dedup'd of t5)
+#   AudioGen Med:   ~1.7 GB  (UNet + encodec, dedup'd of t5)
+# Total expected: ~7-8 GB of model weights baked, vs 30 GB on v1.0.4.
+
+# --- Step 5c-1: t5-base download + inline slim ---
 RUN python3 - <<'PYEOF'
-import os, sys
-os.environ.setdefault("HF_HOME", "/workspace/models")
+import pathlib, shutil, time
+from huggingface_hub import snapshot_download
+
+hub = pathlib.Path("/workspace/models/hub")
+hub.mkdir(parents=True, exist_ok=True)
+
+# Download canonical name
+last_err = None
+for attempt in range(1, 4):
+    try:
+        snapshot_download(repo_id="google-t5/t5-base", cache_dir=str(hub),
+            allow_patterns=["*.json","*.txt","*.model","spiece.model","tokenizer*","special_tokens_map.json","added_tokens.json","*.safetensors","*.bin"])
+        break
+    except Exception as e:
+        last_err = e
+        print(f"  attempt {attempt} failed: {e}", flush=True)
+        time.sleep(5 * attempt)
+else:
+    raise RuntimeError(f"Failed to download t5-base: {last_err}")
+
+# Symlink legacy alias
+legacy = hub / "models--t5-base"
+canonical = hub / "models--google-t5--t5-base"
+if canonical.exists() and not legacy.exists():
+    legacy.symlink_to(canonical)
+    print(f"  symlink: {legacy.name} → {canonical.name}", flush=True)
+
+# Inline slim: resolve symlinks → real files in snapshots/, delete blobs/
+snap_root = canonical / "snapshots"
+if snap_root.is_dir():
+    for snap in snap_root.iterdir():
+        for f in snap.iterdir():
+            if f.is_symlink():
+                target = f.resolve()
+                if target.is_file():
+                    f.unlink()
+                    shutil.copy2(str(target), str(f))
+blobs = canonical / "blobs"
+if blobs.is_dir():
+    sz = sum(p.stat().st_size for p in blobs.rglob("*") if p.is_file())
+    shutil.rmtree(str(blobs))
+    print(f"  removed t5-base blobs/ ({sz/1024/1024:.0f} MB)", flush=True)
+sz_final = sum(p.stat().st_size for p in canonical.rglob("*") if p.is_file())
+print(f"  t5-base final: {sz_final/1024/1024:.0f} MB", flush=True)
+PYEOF
+
+# --- Step 5c-2: t5-large download + inline slim ---
+RUN python3 - <<'PYEOF'
+import pathlib, shutil, time
+from huggingface_hub import snapshot_download
+
+hub = pathlib.Path("/workspace/models/hub")
+
+last_err = None
+for attempt in range(1, 4):
+    try:
+        snapshot_download(repo_id="google-t5/t5-large", cache_dir=str(hub),
+            allow_patterns=["*.json","*.txt","*.model","spiece.model","tokenizer*","special_tokens_map.json","added_tokens.json","*.safetensors","*.bin"])
+        break
+    except Exception as e:
+        last_err = e
+        print(f"  attempt {attempt} failed: {e}", flush=True)
+        time.sleep(5 * attempt)
+else:
+    raise RuntimeError(f"Failed to download t5-large: {last_err}")
+
+legacy = hub / "models--t5-large"
+canonical = hub / "models--google-t5--t5-large"
+if canonical.exists() and not legacy.exists():
+    legacy.symlink_to(canonical)
+    print(f"  symlink: {legacy.name} → {canonical.name}", flush=True)
+
+snap_root = canonical / "snapshots"
+if snap_root.is_dir():
+    for snap in snap_root.iterdir():
+        for f in snap.iterdir():
+            if f.is_symlink():
+                target = f.resolve()
+                if target.is_file():
+                    f.unlink()
+                    shutil.copy2(str(target), str(f))
+blobs = canonical / "blobs"
+if blobs.is_dir():
+    sz = sum(p.stat().st_size for p in blobs.rglob("*") if p.is_file())
+    shutil.rmtree(str(blobs))
+    print(f"  removed t5-large blobs/ ({sz/1024/1024:.0f} MB)", flush=True)
+sz_final = sum(p.stat().st_size for p in canonical.rglob("*") if p.is_file())
+print(f"  t5-large final: {sz_final/1024/1024:.0f} MB", flush=True)
+
+# Sanity: T5Tokenizer must work via legacy alias
+from transformers import T5Tokenizer
+tok = T5Tokenizer.from_pretrained("t5-base")
+print(f"  T5Tokenizer.from_pretrained('t5-base') OK", flush=True)
+PYEOF
+
+# --- Step 6a: MusicGen Medium download + inline slim ---
+RUN python3 - <<'PYEOF'
+import pathlib, shutil
 from audiocraft.models import MusicGen
 print("Downloading MusicGen Medium...", flush=True)
 m = MusicGen.get_pretrained("facebook/musicgen-medium")
 del m
 print("MusicGen Medium downloaded", flush=True)
-PYEOF
 
-# --- Step 6b: Pre-download AudioGen Medium (separate layer) ---
-RUN python3 - <<'PYEOF'
-import os, sys
-os.environ.setdefault("HF_HOME", "/workspace/models")
-from audiocraft.models import AudioGen
-print("Downloading AudioGen Medium...", flush=True)
-a = AudioGen.get_pretrained("facebook/audiogen-medium")
-del a
-print("AudioGen Medium downloaded", flush=True)
-PYEOF
-
-# --- Step 6c: Slim HF cache + verify (CI-O-FISH-4 v1.0.4) ---
-# Same slim treatment as chatterbox v1.0.3:
-#   1. Resolve every snapshot symlink to a real file (in-place rewrite).
-#   2. Delete blobs/ — Docker's overlay would otherwise store both the
-#      symlink target AND the symlink itself, doubling effective size.
-#   3. Drop .huggingface/ metadata + .lock / .partial leftovers.
-#   4. t5-large legacy-name symlink (deploy_fish.sh:484-490 contract).
-#   5. Verify total size + that both models actually landed.
-RUN python3 - <<'PYEOF'
-import os, pathlib, shutil, sys
-
+# Inline slim: resolve symlinks across ALL freshly-touched HF cache dirs
+# (audiocraft.get_pretrained also pulls encodec_32khz + sometimes sd-vae;
+# slim them all so blobs/ never lands in this layer).
 hub = pathlib.Path("/workspace/models/hub")
-
-# t5-large cache name drift symlink (legacy contract)
-old = hub / "models--t5-large"
-new = hub / "models--google-t5--t5-large"
-if new.exists() and not old.exists():
-    old.symlink_to(new)
-    print("t5-large legacy symlink created")
-
-# Slim each model's snapshots/blobs
 for model_dir in hub.glob("models--*"):
     if model_dir.is_symlink():
         continue
@@ -272,19 +300,47 @@ for model_dir in hub.glob("models--*"):
     if blobs.is_dir():
         sz = sum(p.stat().st_size for p in blobs.rglob("*") if p.is_file())
         shutil.rmtree(str(blobs))
-        print(f"  removed {model_dir.name}/blobs/ ({sz / 1024 / 1024:.0f} MB freed)")
+        print(f"  removed {model_dir.name}/blobs/ ({sz/1024/1024:.0f} MB)", flush=True)
+PYEOF
 
-# Cleanup metadata + leftover lock/partial files
+# --- Step 6b: AudioGen Medium download + inline slim ---
+RUN python3 - <<'PYEOF'
+import pathlib, shutil
+from audiocraft.models import AudioGen
+print("Downloading AudioGen Medium...", flush=True)
+a = AudioGen.get_pretrained("facebook/audiogen-medium")
+del a
+print("AudioGen Medium downloaded", flush=True)
+
+hub = pathlib.Path("/workspace/models/hub")
+for model_dir in hub.glob("models--*"):
+    if model_dir.is_symlink():
+        continue
+    snap_root = model_dir / "snapshots"
+    if snap_root.is_dir():
+        for snap in snap_root.iterdir():
+            for f in snap.iterdir():
+                if f.is_symlink():
+                    target = f.resolve()
+                    if target.is_file():
+                        f.unlink()
+                        shutil.copy2(str(target), str(f))
+    blobs = model_dir / "blobs"
+    if blobs.is_dir():
+        sz = sum(p.stat().st_size for p in blobs.rglob("*") if p.is_file())
+        shutil.rmtree(str(blobs))
+        print(f"  removed {model_dir.name}/blobs/ ({sz/1024/1024:.0f} MB)", flush=True)
+
+# Final cleanup + verify
 hf_meta = hub / ".huggingface"
 if hf_meta.is_dir():
     shutil.rmtree(str(hf_meta))
-    print("removed .huggingface/ metadata")
 for p in hub.rglob("*.lock"):
     p.unlink()
 for p in hub.rglob("*.partial"):
     p.unlink()
 
-# Verify both models landed
+import sys
 def model_size(pattern):
     for d in hub.iterdir():
         if d.is_symlink():
@@ -292,16 +348,15 @@ def model_size(pattern):
         if pattern in d.name:
             return sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
     return 0
-
-bgm_size = model_size("facebook--musicgen-medium")
-sfx_size = model_size("facebook--audiogen-medium")
-print(f"MusicGen Medium: {bgm_size / 1024 / 1024:.0f} MB")
-print(f"AudioGen Medium: {sfx_size / 1024 / 1024:.0f} MB")
-if bgm_size < 1_500_000_000 or sfx_size < 1_500_000_000:
+bgm = model_size("facebook--musicgen-medium")
+sfx = model_size("facebook--audiogen-medium")
+print(f"MusicGen Medium: {bgm/1024/1024:.0f} MB")
+print(f"AudioGen Medium: {sfx/1024/1024:.0f} MB")
+if bgm < 1_500_000_000 or sfx < 1_500_000_000:
     print("FATAL: model size below threshold", file=sys.stderr)
     sys.exit(1)
 total = sum(p.stat().st_size for p in hub.rglob("*") if p.is_file())
-print(f"final hub size: {total / 1024 / 1024:.0f} MB")
+print(f"final hub size: {total/1024/1024:.0f} MB")
 PYEOF
 
 # --- Bake the api_server + entrypoint ---
@@ -322,7 +377,7 @@ LABEL org.opencontainers.image.title="onshot-fish-audio"
 LABEL org.opencontainers.image.description="OnShot fish-audio pod — MusicGen Medium (BGM) + AudioGen Medium (SFX), fully baked"
 LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/onshot-docker"
 LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.0.4"
+LABEL org.opencontainers.image.version="1.0.5"
 LABEL onshot.role="audio"
 LABEL onshot.engine="fish-audiocraft"
 

@@ -123,6 +123,13 @@ RUN mkdir -p /workspace/models /opt /tmp/audio-outputs /root/audio-logs
 #   2. After download, resolve symlinks → real files in snapshots/, then
 #      delete the blobs/ dir (Docker layer keeps only one copy of each).
 #   3. Remove .huggingface/ metadata + any .lock / .partial files.
+# CI-O-CHATTER-3 (v1.0.4): inline slim into SAME RUN as download.
+# v1.0.3 ran download (L38=2.76GB) + slim (L39=2.76GB) in separate RUNs;
+# Docker overlay can't actually delete L38's blobs (only mask them with
+# whiteouts in L39), so total grew rather than shrank. v1.0.4 fixes this
+# by doing snapshot_download + symlink resolve + blobs/ delete + verify
+# all in ONE RUN — the layer commits the FINAL state directly with no
+# leftover blobs/.
 RUN python3 - <<'PYEOF'
 import os, pathlib, sys, time, shutil
 from huggingface_hub import snapshot_download
@@ -158,72 +165,58 @@ for attempt in range(1, 4):
 else:
     raise RuntimeError(f"Failed to download {repo_id}: {last_err}")
 
-snap_root = cache_root / "models--ResembleAI--chatterbox" / "snapshots"
+# --- Inline slim: resolve symlinks → real files, then delete blobs/ ---
+chatter = cache_root / "models--ResembleAI--chatterbox"
+snap_root = chatter / "snapshots"
 if not snap_root.is_dir():
     print(f"FATAL: snapshot dir missing at {snap_root}", file=sys.stderr)
     sys.exit(1)
 
-# Verify before we mutate anything.
+# Resolve symlinks in-place
+for snap in snap_root.iterdir():
+    for f in snap.iterdir():
+        if f.is_symlink():
+            target = f.resolve()
+            if target.is_file():
+                f.unlink()
+                shutil.copy2(str(target), str(f))
+
+# Delete blobs/ (now redundant with resolved files in snapshots/)
+blobs = chatter / "blobs"
+if blobs.is_dir():
+    sz = sum(p.stat().st_size for p in blobs.rglob("*") if p.is_file())
+    shutil.rmtree(str(blobs))
+    print(f"  removed blobs/ ({sz/1024/1024:.0f} MB freed)", flush=True)
+
+# Cleanup metadata + leftovers
+hf_meta = cache_root / ".huggingface"
+if hf_meta.is_dir():
+    shutil.rmtree(str(hf_meta))
+for p in cache_root.rglob("*.lock"):
+    p.unlink()
+for p in cache_root.rglob("*.partial"):
+    p.unlink()
+
+# Verify expected files all present + total > 2GB
 total_bytes = 0
 found = set()
 for snap in snap_root.iterdir():
     for f in snap.iterdir():
-        real = f.resolve() if f.is_symlink() else f
-        if real.is_file():
-            sz = real.stat().st_size
+        if f.is_file():
+            sz = f.stat().st_size
             total_bytes += sz
-            print(f"  {f.name}: {sz / 1024 / 1024:.1f} MB", flush=True)
             found.add(f.name)
 missing = set(ALLOW) - found
 if missing:
     print(f"FATAL: missing expected files: {missing}", file=sys.stderr)
     sys.exit(1)
 if total_bytes < 2_000_000_000:
-    print(f"FATAL: total weights only {total_bytes / 1024 / 1024:.0f} MB (expected ~2700 MB)", file=sys.stderr)
+    print(f"FATAL: total weights only {total_bytes/1024/1024:.0f} MB", file=sys.stderr)
     sys.exit(1)
-print(f"All chatterbox weights baked OK ({total_bytes / 1024 / 1024:.0f} MB)")
+print(f"All chatterbox weights baked OK ({total_bytes/1024/1024:.0f} MB)")
 PYEOF
 
-# --- Step 3b: Slim the HF cache layer (CI-O-CHATTER-2) ---
-# After download:
-#   1. Resolve every snapshot symlink to a real file (in-place rewrite). This
-#      lets us delete blobs/ — Docker's overlay would otherwise treat the
-#      symlink + blob as two separate files and store both.
-#   2. Delete the .huggingface/ metadata dir (~tens of MB of caches we never
-#      read at runtime).
-#   3. Delete any *.lock / *.partial leftovers from interrupted downloads.
-# Net: ~9.7 GB layer → ~3 GB.
-RUN python3 - <<'PYEOF'
-import os, pathlib, shutil
-hub = pathlib.Path("/workspace/models/hub")
-chatter = hub / "models--ResembleAI--chatterbox"
-snap_root = chatter / "snapshots"
-if snap_root.is_dir():
-    for snap in snap_root.iterdir():
-        for f in snap.iterdir():
-            if f.is_symlink():
-                target = f.resolve()
-                if target.is_file():
-                    sz_before = target.stat().st_size
-                    f.unlink()
-                    shutil.copy2(str(target), str(f))
-                    print(f"  resolved symlink {f.name} ({sz_before/1024/1024:.0f} MB)")
-blobs = chatter / "blobs"
-if blobs.is_dir():
-    sz = sum(p.stat().st_size for p in blobs.rglob("*") if p.is_file())
-    shutil.rmtree(str(blobs))
-    print(f"  removed blobs/ ({sz/1024/1024:.0f} MB freed)")
-hf_meta = hub / ".huggingface"
-if hf_meta.is_dir():
-    shutil.rmtree(str(hf_meta))
-    print("  removed .huggingface/ metadata")
-for p in hub.rglob("*.lock"):
-    p.unlink(); print(f"  removed lock {p}")
-for p in hub.rglob("*.partial"):
-    p.unlink(); print(f"  removed partial {p}")
-total = sum(p.stat().st_size for p in hub.rglob("*") if p.is_file())
-print(f"final hub size: {total/1024/1024:.0f} MB")
-PYEOF
+# Step 3b removed (v1.0.4): slim is now inline in Step 3 above.
 
 # --- Step 4: Bake api_server + entrypoint ---
 COPY chatterbox_api_server.py /opt/chatterbox_api_server.py
@@ -239,7 +232,7 @@ LABEL org.opencontainers.image.title="onshot-chatterbox-multilingual"
 LABEL org.opencontainers.image.description="OnShot chatterbox-multilingual TTS pod — Hindi/multilingual TTS + zero-shot voice cloning, fully baked"
 LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/onshot-docker"
 LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.0.3"
+LABEL org.opencontainers.image.version="1.0.4"
 LABEL onshot.role="audio"
 LABEL onshot.engine="chatterbox-multilingual"
 
