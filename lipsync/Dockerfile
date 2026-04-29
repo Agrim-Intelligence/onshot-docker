@@ -100,7 +100,8 @@ RUN cd /workspace/ComfyUI/custom_nodes \
  && cd ComfyUI-LatentSyncWrapper \
  && pip install --break-system-packages -r requirements.txt \
  && pip install --break-system-packages --upgrade torchcodec soundfile \
- && pip install --break-system-packages insightface onnxruntime-gpu accelerate
+ && pip install --break-system-packages insightface onnxruntime-gpu accelerate \
+ && pip install --break-system-packages librosa
 
 # --- Step 2: ComfyUI-VideoHelperSuite (mirrors deploy script:240-256) ---
 ARG VIDEO_HELPER_REPO=https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
@@ -212,7 +213,7 @@ LABEL org.opencontainers.image.title="onshot-lipsync-latentsync"
 LABEL org.opencontainers.image.description="OnShot lipsync pod — ComfyUI + LatentSync 1.6 + post-processing sidecar, fully baked"
 LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/onshot-docker"
 LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.6.7"
+LABEL org.opencontainers.image.version="1.6.8"
 LABEL onshot.role="lipsync"
 LABEL onshot.engine="latentsync-1.6"
 
