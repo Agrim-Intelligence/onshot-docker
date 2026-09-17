@@ -260,6 +260,7 @@ class ModelManager:
             instance = await self._ensure_locked(kind, music_variant=music_variant)
 
             def _render() -> Dict[str, Any]:
+                started = time.monotonic()
                 instance.set_generation_params(duration=duration)
                 audio = instance.generate([prompt])[0].cpu()
                 wav = OUTPUT_DIR / f"{output_stem}.wav"
@@ -276,6 +277,7 @@ class ModelManager:
                     "engine": "musicgen" if kind == "music" else "audiogen",
                     "music_model": self._music_variant if kind == "music" else None,
                     "duration_requested_s": duration,
+                    "elapsed_s": round(time.monotonic() - started, 2),
                     "download_wav": f"/api/v1/download/{output_stem}?format=wav",
                     "download_mp3": f"/api/v1/download/{output_stem}?format=mp3",
                 }
@@ -1252,8 +1254,6 @@ async def generate_music(
     verify_api_key(x_api_key)
 
     job_id = str(uuid.uuid4())
-    wav = OUTPUT_DIR / f"{job_id}.wav"
-    mp3 = OUTPUT_DIR / f"{job_id}.mp3"
 
     # Resolve short names to full HF IDs
     resolved_model = ""
@@ -1266,25 +1266,11 @@ async def generate_music(
         else:
             resolved_model = music_model  # pass-through for custom IDs
 
-    t_start = time.monotonic()
     try:
-        # ModelManager ensures MusicGen is the active kind — swaps out
-        # fish-speech / AudioGen / XTTS if needed. Idempotent when already loaded.
-        music = await manager.ensure("music", music_variant=resolved_model)
-        music.set_generation_params(duration=duration)
-
-        audio = music.generate([prompt])[0].cpu()
-        gen_elapsed = round(time.monotonic() - t_start, 2)
-
-        audio_write(
-            wav.with_suffix(""),
-            audio,
-            music.sample_rate,
-            strategy="loudness",
-            loudness_compressor=True,
+        result = await manager.generate_audio(
+            "music", prompt=prompt, duration=duration,
+            music_variant=resolved_model, output_stem=job_id,
         )
-
-        wav_to_mp3(wav, mp3)
 
         # NOTE: intentionally NOT unloading MusicGen here. The manager keeps
         # it resident; subsequent BGM requests reuse without reload. Next
@@ -1294,9 +1280,9 @@ async def generate_music(
         return {
             "job_id": job_id,
             "engine": "musicgen",
-            "music_model": manager._music_variant,
+            "music_model": result.get("music_model") or manager._music_variant,
             "duration_requested_s": duration,
-            "elapsed_s": gen_elapsed,
+            "elapsed_s": result.get("elapsed_s", 0),
             "download_wav": f"/api/v1/download/{job_id}?format=wav",
             "download_mp3": f"/api/v1/download/{job_id}?format=mp3",
         }
@@ -1319,28 +1305,12 @@ async def generate_sfx(
     verify_api_key(x_api_key)
 
     job_id = str(uuid.uuid4())
-    wav = OUTPUT_DIR / f"{job_id}.wav"
-    mp3 = OUTPUT_DIR / f"{job_id}.mp3"
 
-    t_start = time.monotonic()
     try:
-        # ModelManager ensures AudioGen is the active kind — swaps out
-        # fish-speech / MusicGen / XTTS if needed. Idempotent when already loaded.
-        sfx = await manager.ensure("sfx")
-        sfx.set_generation_params(duration=duration)
-
-        audio = sfx.generate([prompt])[0].cpu()
-        gen_elapsed = round(time.monotonic() - t_start, 2)
-
-        audio_write(
-            wav.with_suffix(""),
-            audio,
-            sfx.sample_rate,
-            strategy="loudness",
-            loudness_compressor=True,
+        result = await manager.generate_audio(
+            "sfx", prompt=prompt, duration=duration,
+            output_stem=job_id,
         )
-
-        wav_to_mp3(wav, mp3)
 
         # NOTE: keep AudioGen resident — subsequent SFX requests reuse.
         # Next /voice/fish_* or /music call triggers the swap via manager.ensure.
@@ -1349,7 +1319,7 @@ async def generate_sfx(
             "job_id": job_id,
             "engine": "audiogen",
             "duration_requested_s": duration,
-            "elapsed_s": gen_elapsed,
+            "elapsed_s": result.get("elapsed_s", 0),
             "download_wav": f"/api/v1/download/{job_id}?format=wav",
             "download_mp3": f"/api/v1/download/{job_id}?format=mp3",
         }
