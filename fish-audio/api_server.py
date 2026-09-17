@@ -1,7 +1,11 @@
+from __future__ import annotations
+
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Form, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pathlib import Path
 from typing import Optional, Dict, Any
+import hashlib
+import json
 import uuid
 import os
 import gc
@@ -11,6 +15,8 @@ import asyncio
 import logging
 import subprocess
 from datetime import datetime, timezone
+
+from job_registry import IdempotencyConflict, JobRegistry
 
 import torch
 import numpy as np
@@ -61,7 +67,7 @@ os.environ["COQUI_TOS_AGREED"] = "1"
 # ---------------------------------------------------------------------
 # LOGGING  — always on local container disk (not network volume)
 # ---------------------------------------------------------------------
-LOG_DIR = Path("/root/audio-logs")
+LOG_DIR = Path(os.getenv("AUDIO_LOG_DIR", "/root/audio-logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -82,6 +88,12 @@ app = FastAPI(title="Audio Generation API", version="1.3.0")
 API_KEY = os.getenv("AUDIO_API_KEY", "sk-audio-2024-change-me")
 OUTPUT_DIR = Path("/tmp/audio-outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+JOB_REGISTRY = JobRegistry(
+    max_records=int(os.getenv("AUDIO_ASYNC_MAX_RECORDS", "256")),
+    terminal_ttl_sec=float(os.getenv("AUDIO_ASYNC_TERMINAL_TTL_SEC", "3600")),
+)
+_ASYNC_TASKS: set[asyncio.Task] = set()
 
 # Fish-speech API server runs on port 8080 inside the pod (started by deploy.sh).
 # The main API server proxies /api/v1/voice/fish_* requests to it.
@@ -179,62 +191,96 @@ class ModelManager:
         Idempotent: returns the live instance if already active.
         Raises HTTPException(503) if model load fails (VRAM stays clean).
         """
+        async with self.lock:
+            return await self._ensure_locked(kind, music_variant=music_variant)
+
+    async def _ensure_locked(self, kind: str, *, music_variant: str = "") -> Any:
+        """Ensure a model while the caller owns ``self.lock``."""
         if kind not in _VALID_KINDS:
             raise ValueError(f"Unknown kind: {kind!r}. Valid: {sorted(_VALID_KINDS)}")
 
-        async with self.lock:
-            # Music variant change triggers reload even when kind matches
-            wants_reload = (
-                kind == "music"
-                and self.active_kind == "music"
-                and music_variant
-                and music_variant != self._music_variant
-            )
-            if self.active_kind == kind and not wants_reload:
-                logger.info(f"[VRAM] ensure({kind}): already active — reuse")
-                return self._instance
-
-            t0 = time.monotonic()
-            before_kind = self.active_kind
-            before_vram = _vram_stats_gb()
-
-            # 1. Unload whatever is currently active.
-            if self.active_kind is not None:
-                self._unload_current()
-
-            # 2. Load the target kind.
-            try:
-                self._instance = self._load(kind, music_variant=music_variant)
-                self.active_kind = kind
-                if kind == "music":
-                    self._music_variant = music_variant or _default_music_model()
-            except Exception as load_err:
-                # Leave VRAM clean on failure — do not pin a broken ref.
-                self._instance = None
-                self.active_kind = None
-                self._force_vram_clean()
-                logger.exception(f"[VRAM] ensure({kind}) failed")
-                raise HTTPException(status_code=503, detail=f"Failed to load {kind}: {load_err}") from load_err
-
-            elapsed = round(time.monotonic() - t0, 2)
-            after_vram = _vram_stats_gb()
-            entry = {
-                "at": datetime.now(timezone.utc).isoformat(),
-                "from": before_kind,
-                "to": kind,
-                "elapsed_s": elapsed,
-                "vram_before_gb": before_vram,
-                "vram_after_gb": after_vram,
-            }
-            self._swap_history.append(entry)
-            if len(self._swap_history) > 20:
-                self._swap_history = self._swap_history[-20:]
-            logger.info(
-                f"[VRAM] swap {before_kind or 'empty'} -> {kind} in {elapsed}s "
-                f"(allocated {before_vram['allocated']}GB -> {after_vram['allocated']}GB / "
-                f"{after_vram['total']}GB total)"
-            )
+        wants_reload = (
+            kind == "music"
+            and self.active_kind == "music"
+            and music_variant
+            and music_variant != self._music_variant
+        )
+        if self.active_kind == kind and not wants_reload:
+            logger.info(f"[VRAM] ensure({kind}): already active — reuse")
             return self._instance
+
+        t0 = time.monotonic()
+        before_kind = self.active_kind
+        before_vram = _vram_stats_gb()
+        if self.active_kind is not None:
+            self._unload_current()
+        try:
+            self._instance = await asyncio.to_thread(self._load, kind, music_variant=music_variant)
+            self.active_kind = kind
+            if kind == "music":
+                self._music_variant = music_variant or _default_music_model()
+        except Exception as load_err:
+            self._instance = None
+            self.active_kind = None
+            self._force_vram_clean()
+            logger.exception(f"[VRAM] ensure({kind}) failed")
+            raise HTTPException(status_code=503, detail=f"Failed to load {kind}: {load_err}") from load_err
+
+        elapsed = round(time.monotonic() - t0, 2)
+        after_vram = _vram_stats_gb()
+        entry = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "from": before_kind,
+            "to": kind,
+            "elapsed_s": elapsed,
+            "vram_before_gb": before_vram,
+            "vram_after_gb": after_vram,
+        }
+        self._swap_history.append(entry)
+        if len(self._swap_history) > 20:
+            self._swap_history = self._swap_history[-20:]
+        logger.info(
+            f"[VRAM] swap {before_kind or 'empty'} -> {kind} in {elapsed}s "
+            f"(allocated {before_vram['allocated']}GB -> {after_vram['allocated']}GB / "
+            f"{after_vram['total']}GB total)"
+        )
+        return self._instance
+
+    async def generate_audio(
+        self,
+        kind: str,
+        *,
+        prompt: str,
+        duration: int,
+        music_variant: str = "",
+        output_stem: str,
+    ) -> Dict[str, Any]:
+        """Generate an effect while holding the single-model critical section."""
+        async with self.lock:
+            instance = await self._ensure_locked(kind, music_variant=music_variant)
+
+            def _render() -> Dict[str, Any]:
+                instance.set_generation_params(duration=duration)
+                audio = instance.generate([prompt])[0].cpu()
+                wav = OUTPUT_DIR / f"{output_stem}.wav"
+                mp3 = OUTPUT_DIR / f"{output_stem}.mp3"
+                audio_write(
+                    wav.with_suffix(""),
+                    audio,
+                    instance.sample_rate,
+                    strategy="loudness",
+                    loudness_compressor=True,
+                )
+                wav_to_mp3(wav, mp3)
+                return {
+                    "engine": "musicgen" if kind == "music" else "audiogen",
+                    "music_model": self._music_variant if kind == "music" else None,
+                    "duration_requested_s": duration,
+                    "download_wav": f"/api/v1/download/{output_stem}?format=wav",
+                    "download_mp3": f"/api/v1/download/{output_stem}?format=mp3",
+                }
+
+            return await asyncio.to_thread(_render)
 
     async def unload_all(self) -> Dict[str, Any]:
         """Explicitly release all VRAM. Used before shutdown or by /api/v1/unload."""
@@ -373,6 +419,12 @@ async def _maybe_prewarm_fish_speech():
 
 @app.on_event("shutdown")
 async def _release_vram_on_shutdown():
+    pending = list(_ASYNC_TASKS)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    JOB_REGISTRY.clear()
     try:
         await manager.unload_all()
     except Exception as e:
@@ -622,6 +674,150 @@ def wav_to_mp3(wav: Path, mp3: Path):
         ],
         check=True,
     )
+
+
+# ---------------------------------------------------------------------
+# ASYNC MUSIC / SFX JOBS
+# ---------------------------------------------------------------------
+def _effect_fingerprint(*, kind: str, prompt: str, duration: int, music_model: str = "") -> str:
+    canonical = json.dumps(
+        {"kind": kind, "prompt": prompt, "duration": duration, "music_model": music_model},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _track_async_task(task: asyncio.Task) -> None:
+    _ASYNC_TASKS.add(task)
+    task.add_done_callback(_ASYNC_TASKS.discard)
+
+
+async def _run_async_effect(
+    *,
+    job_id: str,
+    kind: str,
+    prompt: str,
+    duration: int,
+    music_variant: str,
+) -> None:
+    JOB_REGISTRY.mark_running(job_id)
+    try:
+        result = await manager.generate_audio(
+            kind,
+            prompt=prompt,
+            duration=duration,
+            music_variant=music_variant,
+            output_stem=job_id,
+        )
+        JOB_REGISTRY.mark_completed(job_id, **result)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        detail = getattr(exc, "detail", str(exc))
+        JOB_REGISTRY.mark_failed(job_id, detail)
+        logger.exception("Async %s job %s failed", kind, job_id)
+
+
+async def _submit_async_effect(
+    *,
+    kind: str,
+    prompt: str,
+    duration: int,
+    music_model: str,
+    idempotency_key: str,
+) -> JSONResponse:
+    if not idempotency_key.strip():
+        raise HTTPException(status_code=400, detail="X-Idempotency-Key is required")
+    clean_prompt = prompt.strip()
+    if not clean_prompt:
+        raise HTTPException(status_code=400, detail="prompt must not be empty")
+    if duration <= 0:
+        raise HTTPException(status_code=400, detail="duration must be positive")
+
+    resolved_model = ""
+    if kind == "music":
+        value = (music_model or "").strip().lower()
+        if value in ("", "large", "facebook/musicgen-large"):
+            resolved_model = "facebook/musicgen-large" if value != "medium" else "facebook/musicgen-medium"
+        elif value in ("medium", "facebook/musicgen-medium"):
+            resolved_model = "facebook/musicgen-medium"
+        else:
+            resolved_model = music_model.strip()
+
+    fingerprint = _effect_fingerprint(
+        kind=kind,
+        prompt=clean_prompt,
+        duration=duration,
+        music_model=resolved_model,
+    )
+    try:
+        status, created = JOB_REGISTRY.submit_with_created(
+            idempotency_key=idempotency_key.strip(),
+            kind=kind,
+            request_fingerprint=fingerprint,
+        )
+    except IdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if created:
+        task = asyncio.create_task(
+            _run_async_effect(
+                job_id=status["job_id"],
+                kind=kind,
+                prompt=clean_prompt,
+                duration=duration,
+                music_variant=resolved_model,
+            )
+        )
+        _track_async_task(task)
+    return JSONResponse(status_code=202, content=status)
+
+
+@app.post("/api/v1/jobs/music")
+async def submit_music_job(
+    prompt: str = Form(...),
+    duration: int = Form(30),
+    music_model: Optional[str] = Form(None),
+    request_id: Optional[str] = Form(None),
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_api_key: str = Header(None),
+):
+    verify_api_key(x_api_key)
+    return await _submit_async_effect(
+        kind="music",
+        prompt=prompt,
+        duration=duration,
+        music_model=music_model or "facebook/musicgen-large",
+        idempotency_key=x_idempotency_key or request_id or "",
+    )
+
+
+@app.post("/api/v1/jobs/sfx")
+async def submit_sfx_job(
+    prompt: str = Form(...),
+    duration: int = Form(8),
+    request_id: Optional[str] = Form(None),
+    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
+    x_api_key: str = Header(None),
+):
+    verify_api_key(x_api_key)
+    return await _submit_async_effect(
+        kind="sfx",
+        prompt=prompt,
+        duration=duration,
+        music_model="",
+        idempotency_key=x_idempotency_key or request_id or "",
+    )
+
+
+@app.get("/api/v1/jobs/{job_id}")
+async def async_job_status(job_id: str, x_api_key: str = Header(None)):
+    verify_api_key(x_api_key)
+    status = JOB_REGISTRY.status(job_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Audio job not found (pod may have restarted)")
+    return status
 
 # ---------------------------------------------------------------------
 # BASIC HINDI TTS (MMS) — xtts mode only
