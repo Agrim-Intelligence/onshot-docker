@@ -83,7 +83,7 @@ logger = logging.getLogger("audio-server")
 # ---------------------------------------------------------------------
 # APP
 # ---------------------------------------------------------------------
-app = FastAPI(title="Audio Generation API", version="1.3.0")
+app = FastAPI(title="Audio Generation API", version="1.3.1")
 
 API_KEY = os.getenv("AUDIO_API_KEY", "sk-audio-2024-change-me")
 OUTPUT_DIR = Path("/tmp/audio-outputs")

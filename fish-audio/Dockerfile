@@ -377,7 +377,7 @@ LABEL org.opencontainers.image.title="onshot-fish-audio"
 LABEL org.opencontainers.image.description="OnShot fish-audio pod — MusicGen Medium (BGM) + AudioGen Medium (SFX), fully baked"
 LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/onshot-docker"
 LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.0.5"
+LABEL org.opencontainers.image.version="1.0.6"
 LABEL onshot.role="audio"
 LABEL onshot.engine="fish-audiocraft"
 
