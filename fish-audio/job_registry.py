@@ -142,12 +142,14 @@ class JobRegistry:
 
     def _evict_locked(self) -> None:
         now = time.monotonic()
-        expired = [
-            record
-            for record in self._records.values()
-            if record.status in ("completed", "failed")
-            and now - record.updated_at >= self.terminal_ttl_sec
-        ]
+        expired = []
+        if self.terminal_ttl_sec > 0:
+            expired = [
+                record
+                for record in self._records.values()
+                if record.status in ("completed", "failed")
+                and now - record.updated_at >= self.terminal_ttl_sec
+            ]
         for record in expired:
             self._remove_locked(record)
 
